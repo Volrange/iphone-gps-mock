@@ -17,6 +17,21 @@ import sys
 from coordinates import to_wgs84
 
 STATE_PATH = Path(__file__).resolve().parent / ".state" / "pending_restore.json"
+# Keep the diagnostic reboot record readable until the user verifies the phone.
+VERIFICATION_STATES = {"awaiting_verification", "restart_requested"}
+RECOVERY_GUIDE = (
+    "停止模拟后，地图仍显示旧位置时：\n"
+    "1. 先在 iPhone 自带地图点击定位，判断是否所有 App 都受影响。\n"
+    "2. 若系统地图也不正确，在手机“设置”中暂时关闭 Wi-Fi 和蓝牙，"
+    "保留蜂窝数据与定位服务。\n"
+    "3. 让系统地图保持前台，点击定位并等待约 60 秒，再核验实际位置。\n"
+    "4. 恢复后，依次重新开启 Wi-Fi、蓝牙，每次检查位置是否仍正常；"
+    "最后在目标 App 重新定位。\n"
+    "5. 两个地图均正常后，点击“确认手机已恢复”。若仍不正确，请保留恢复记录。\n\n"
+    "本次真机排查中，临时关闭 Wi-Fi 和蓝牙后恢复了真实位置；"
+    "这不代表已确定是 Wi-Fi、蓝牙或某个缓存导致，也不保证适用于所有设备。"
+    "这些手机开关需要手动操作，程序不会自动切换。"
+)
 
 
 class ControlError(RuntimeError):
@@ -60,7 +75,10 @@ class PhoneController:
             raise ControlError("恢复记录损坏，请保留 .state 文件并排查；不能确认上次是否已恢复。") from exc
 
     def _mark_pending(self, lat, lon):
-        data = {"udid": self.udid, "latitude": lat, "longitude": lon}
+        self._save_pending({"udid": self.udid, "latitude": lat, "longitude": lon,
+                            "status": "simulating"})
+
+    def _save_pending(self, data):
         self.state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         temporary = self.state_path.with_suffix(".tmp")
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -95,7 +113,8 @@ class PhoneController:
                 mounted = await asyncio.wait_for(mounter.is_image_mounted("Personalized"), 15)
             info = {"name": phone.all_values.get("DeviceName", "iPhone"),
                     "version": phone.product_version, "developer_mode": enabled,
-                    "mounted": mounted, "pending_restore": bool(self.pending)}
+                    "mounted": mounted, "pending_restore": bool(self.pending),
+                    "recovery_status": self.pending.get("status") if self.pending else None}
             self.log(f"USB 已连接：{info['name']} · iOS {info['version']} · 开发者模式{'已开' if enabled else '未开'}")
             return info
 
@@ -177,26 +196,54 @@ class PhoneController:
         return {"latitude": lat, "longitude": lon}
 
     async def restore(self):
-        # Reconnect if necessary; never equate terminating a process with clearing simulation.
+        self.log("正在恢复：等待设备确认停止模拟…")
         await self.prepare()
-        await self._connect_location()
+        # Record even a standalone clear: losing this process cannot prove restoration.
+        self._save_pending({**(self.pending or {"udid": self.udid}),
+                            "status": "restore_requested"})
         try:
-            await asyncio.wait_for(self.location.clear(), 20)
-            # The clear selector has no reply. Check that the connection is responsive;
-            # this verifies transport, not real coordinates or another app's cache.
-            await asyncio.wait_for(self.device_info.mach_kernel_name(), 15)
-        except BaseException:
+            for attempt in range(2):
+                try:
+                    await self._connect_location()
+                    # pymobiledevice3's clear() is fire-and-forget. This selector
+                    # supports a DTX reply on the tested device: wait for it on the
+                    # actual location channel, not a different DeviceInfo channel.
+                    await asyncio.wait_for(self.location.service.invoke(
+                        "stopLocationSimulation", expects_reply=True), 15)
+                    # The reply confirms dispatch, not the next GPS fix. Let the
+                    # asynchronous locationd work run before tearing down the tunnel.
+                    await asyncio.sleep(1)
+                    await asyncio.wait_for(self.device_info.mach_kernel_name(), 10)
+                    break
+                except Exception as exc:
+                    if attempt == 1:
+                        raise
+                    self.log("停止请求未完成，将重建连接重试一次：" + explain_error(exc))
+                    await self._disconnect()
+            self._save_pending({**self.pending, "status": "awaiting_verification"})
+        finally:
             await self._disconnect()
-            raise
+
+        self.log("设备已应答停止模拟请求，实际位置仍待核验。请在手机地图重新定位；"
+                 "确认回到真实位置后，再点击“确认手机已恢复”。恢复记录会保留到确认后。")
+        self.log(RECOVERY_GUIDE)
+        return {"status": "awaiting_verification", "acknowledged": True, "verified": False}
+
+    async def confirm_restored(self):
+        """Record an explicit user check of the phone, never infer it from a DTX reply."""
+        if not self.pending or self.pending.get("status") not in VERIFICATION_STATES:
+            raise ControlError("请先执行恢复定位，等待设备应答，再在手机地图核验真实位置。")
         self.state_path.unlink(missing_ok=True)
         self.pending = None
-        await self._disconnect()
-        self.log("已发送清除模拟指令。请在电子地图重新定位，核对真实位置；程序无法读取手机的实际定位。")
+        self.log("已记录你在手机上的恢复确认，待恢复记录已清除。")
+        return {"status": "user_confirmed"}
 
     async def shutdown(self):
-        if self.pending:
-            await self.restore()
-        await self._disconnect()
+        try:
+            if self.pending and self.pending.get("status") not in VERIFICATION_STATES:
+                await self.restore()
+        finally:
+            await self._disconnect()
 
     async def heartbeat(self):
         if self.device_info is not None:
@@ -231,6 +278,9 @@ async def _cli(args):
         await controller.prepare()
     elif args.command == "clear":
         await controller.restore()
+        print("手机地图核验后，可运行 iphone_control.py confirm-restored 清除恢复提醒。", flush=True)
+    elif args.command == "confirm-restored":
+        await controller.confirm_restored()
     else:
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -249,6 +299,7 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("status", "reveal", "prepare", "clear"):
         sub.add_parser(name)
+    sub.add_parser("confirm-restored", help="仅在手机地图已确认真实定位后，清除本地恢复提醒")
     point = sub.add_parser("set")
     point.add_argument("--lat", required=True)
     point.add_argument("--lon", required=True)

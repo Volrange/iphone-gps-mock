@@ -9,7 +9,8 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from coordinates import SIYUAN_GCJ02, to_wgs84
-from iphone_control import PhoneController, acquire_instance_lock, explain_error
+from iphone_control import (PhoneController, RECOVERY_GUIDE, VERIFICATION_STATES,
+                            acquire_instance_lock, explain_error)
 
 
 class GPSMockApp(tk.Tk):
@@ -31,7 +32,10 @@ class GPSMockApp(tk.Tk):
         self.after(100, self._drain)
         self.after(20000, self._monitor)
         if self.controller.pending:
-            self.position.set("上次模拟尚未确认清除，请先恢复真实定位")
+            if self.controller.pending.get("status") in VERIFICATION_STATES:
+                self.position.set("上次恢复尚待手机核验 · 确认真实位置后点击“确认手机已恢复”")
+            else:
+                self.position.set("上次模拟尚未确认清除，请先恢复真实定位")
         if auto_check:
             self.after(200, lambda: self._submit("检查设备", self.controller.status))
 
@@ -86,6 +90,11 @@ class GPSMockApp(tk.Tk):
         actions.pack(fill="x", pady=12)
         self._button(actions, "使用目标定位", self._set)
         self._button(actions, "恢复手机真实定位", lambda: self._submit("恢复定位", self.controller.restore))
+        self._button(actions, "确认手机已恢复", self._confirm_restore)
+        recovery = ttk.Frame(root)
+        recovery.pack(fill="x")
+        self._button(recovery, "恢复后位置仍不正确？", self._show_recovery_help)
+        ttk.Label(recovery, text="查看系统地图与 Wi-Fi / 蓝牙排查步骤", foreground="#555").pack(side="left")
         ttk.Label(root, text="模拟作用于设备定位服务，可能影响其他 App。请在交我办“电子地图”点击定位核验。", foreground="#875400", wraplength=720).pack(anchor="w")
         status = ttk.Frame(root)
         status.pack(fill="x", pady=(12, 6))
@@ -124,6 +133,8 @@ class GPSMockApp(tk.Tk):
             return
         self.busy = True
         self.task.set(label + "…")
+        if label == "恢复定位":
+            self.position.set("恢复中：等待设备应答停止模拟请求，请保持 USB 连接")
         for button in self.buttons:
             button.state(["disabled"])
         self.progress.start(12)
@@ -134,6 +145,17 @@ class GPSMockApp(tk.Tk):
             except BaseException as exc:
                 self.events.put(("done", label, None, explain_error(exc)))
         future.add_done_callback(finished)
+
+    def _confirm_restore(self):
+        if not self.controller.pending or self.controller.pending.get("status") not in VERIFICATION_STATES:
+            messagebox.showinfo("尚未完成清除", "请先点击“恢复手机真实定位”，再到手机地图核验。", parent=self)
+            return
+        if messagebox.askyesno("核验手机真实位置", "你是否已在手机地图重新点击定位，并确认回到了实际所在位置？\n\n"
+                              "这里只记录核验结果，不会向手机发送定位指令。", parent=self):
+            self._submit("确认恢复", self.controller.confirm_restored)
+
+    def _show_recovery_help(self):
+        messagebox.showinfo("恢复定位排查步骤", RECOVERY_GUIDE, parent=self)
 
     def _append(self, text):
         self.log.configure(state="normal")
@@ -174,7 +196,9 @@ class GPSMockApp(tk.Tk):
                     elif label == "设置定位":
                         self.position.set(f"模拟请求完成：{result['latitude']:.7f}, {result['longitude']:.7f} · 等待手机地图核验")
                     elif label == "恢复定位":
-                        self.position.set("清除模拟指令已发送 · 请在手机重新定位，核对真实位置")
+                        self.position.set("停止请求已应答 · 真实定位待手机核验，恢复记录仍保留")
+                    elif label == "确认恢复":
+                        self.position.set("已由你在手机端确认恢复真实定位")
                     elif label == "退出":
                         self._quit()
                         return
