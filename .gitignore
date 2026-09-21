@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.state/
+*.gpx
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+.pytest_cache/
+dist/
+build/
